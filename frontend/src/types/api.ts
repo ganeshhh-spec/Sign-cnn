@@ -21,6 +21,8 @@ export interface HealthResponse {
   gpu_available: boolean;
   gpu_name: string | null;
   model_load_time_seconds: number;
+  checkpoint_name?: string | null;
+  checkpoint_type?: string | null;
 }
 
 export interface PredictionItem {
@@ -37,6 +39,19 @@ export interface StabilizedPredictionResponse {
   is_stable: boolean;
   raw_prediction: string;
   raw_confidence: number;
+  status_reason?: string | null;
+}
+
+export interface SampleGesture {
+  class_label: string;
+  filename: string;
+  is_priority_demo: boolean;
+  image_base64: string;
+}
+
+export interface SamplesResponse {
+  samples: SampleGesture[];
+  count: number;
 }
 
 export interface TrackingDiagnostics {
@@ -49,6 +64,9 @@ export interface TrackingDiagnostics {
   crop_bounds: HandBBox | null;
   frame_size: { width: number; height: number } | null;
   handedness_normalized?: boolean;
+  osn_applied?: boolean;
+  osn_rotation_deg?: number;
+  osn_hand_coverage_pct?: number;
 }
 
 export interface PredictResponse {
@@ -105,6 +123,7 @@ export type PredictRequest = {
   use_stabilizer?: boolean;
   return_top_k?: number;
   capture_debug_crop?: boolean;
+  enable_osn?: boolean;
 };
 
 export type ActionType = 'append' | 'delete' | 'space' | 'clear' | 'none';

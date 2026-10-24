@@ -112,6 +112,11 @@ class ApiClient {
     const response = await this.client.get<PreprocessingConfig>('/api/preprocessing');
     return response.data;
   }
+
+  async getSamples(): Promise<{ samples: import('../types/api').SampleGesture[]; count: number }> {
+    const response = await this.client.get<{ samples: import('../types/api').SampleGesture[]; count: number }>('/api/samples');
+    return response.data;
+  }
 }
 
 export const api = new ApiClient();

@@ -21,7 +21,8 @@ from backend.app.main import (
     app, PredictRequest, health_check, get_classes, predict, translate,
     clear_translation, insert_space, delete_character, reset_translation,
     get_translation_state, get_preprocessing_config, get_model, get_detector,
-    get_stabilizer_service, get_buffer,
+    get_stabilizer_service, get_buffer, get_stabilizer_config, update_stabilizer_config,
+    get_verified_samples, StabilizerConfigRequest,
 )
 from backend.app.services.model_loader import get_model_loader, initialize_model
 from backend.app.services.hand_detector import HandDetector, get_hand_detector_stream, BoundingBoxSmoother
@@ -90,6 +91,13 @@ class DirectEndpointClient:
                 value = resolve_immediate(get_translation_state(get_stabilizer_service(), get_buffer()))
             elif method == "GET" and url == "/api/preprocessing":
                 value = resolve_immediate(get_preprocessing_config(get_model()))
+            elif method == "GET" and url == "/api/stabilizer/config":
+                value = resolve_immediate(get_stabilizer_config(get_stabilizer_service()))
+            elif method == "POST" and url == "/api/stabilizer/config":
+                request = StabilizerConfigRequest.model_validate(kwargs.get("json", {}))
+                value = resolve_immediate(update_stabilizer_config(request, get_stabilizer_service()))
+            elif method == "GET" and url == "/api/samples":
+                value = resolve_immediate(get_verified_samples())
             else:
                 raise AssertionError(f"Unexpected endpoint in test: {method} {url}")
             return DirectResponse(200, response_data(value))
@@ -180,6 +188,10 @@ class TestHealthEndpoint:
         assert "num_classes" in data
         assert "gpu_available" in data
         assert data["num_classes"] == 29
+        assert "checkpoint_name" in data
+        assert "checkpoint_type" in data
+        assert data["checkpoint_name"] is not None
+        assert data["checkpoint_type"] is not None
 
 
 class TestClassesEndpoint:
@@ -944,6 +956,213 @@ class TestRobustStabilizationAndPreprocessing:
         assert "tracking_confidence" in diag
         assert "is_smoothed" in diag
         assert "crop_padding_applied" in diag
+
+
+class TestStabilizerConfigAndSamples:
+    """Test configuration endpoints for stabilizer and sample gesture loading."""
+
+    def test_get_stabilizer_config(self):
+        """GET /api/stabilizer/config returns threshold parameters and rationale."""
+        response = client.get("/api/stabilizer/config")
+        assert response.status_code == 200
+        data = response.json()
+        assert "confidence_threshold" in data
+        assert "min_consistent" in data
+        assert "cooldown_seconds" in data
+        assert "duplicate_guard" in data
+        assert "explanations" in data
+        assert data["confidence_threshold"] == 0.70
+        assert data["min_consistent"] == 3
+        assert data["duplicate_guard"] is True
+
+    def test_update_stabilizer_config(self):
+        """POST /api/stabilizer/config modifies threshold parameters successfully."""
+        orig_response = client.get("/api/stabilizer/config")
+        orig_data = orig_response.json()
+
+        update_response = client.post("/api/stabilizer/config", json={
+            "confidence_threshold": 0.75,
+            "min_consistent": 4,
+            "cooldown_seconds": 1.5,
+            "duplicate_guard": True
+        })
+        assert update_response.status_code == 200
+        data = update_response.json()
+        assert data["success"] is True
+        assert data["config"]["confidence_threshold"] == 0.75
+        assert data["config"]["min_consistent"] == 4
+        assert data["config"]["cooldown_seconds"] == 1.5
+
+        # Restore original config
+        client.post("/api/stabilizer/config", json={
+            "confidence_threshold": orig_data["confidence_threshold"],
+            "min_consistent": orig_data["min_consistent"],
+            "cooldown_seconds": orig_data["cooldown_seconds"],
+            "duplicate_guard": orig_data["duplicate_guard"]
+        })
+
+    def test_get_verified_samples(self):
+        """GET /api/samples returns available demo samples with base64 payload."""
+        response = client.get("/api/samples")
+        assert response.status_code == 200
+        data = response.json()
+        assert "samples" in data
+        assert "count" in data
+        assert data["count"] == len(data["samples"])
+        if data["count"] > 0:
+            sample = data["samples"][0]
+            assert "class_label" in sample
+            assert "filename" in sample
+            assert "is_priority_demo" in sample
+            assert "image_base64" in sample
+            assert len(sample["image_base64"]) > 0
+
+    def test_predict_returns_status_reason(self):
+        """Verify /api/predict returns status_reason in stabilizer payload."""
+        blank_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        _, buffer = cv2.imencode('.jpg', blank_img)
+        test_img = base64.b64encode(buffer).decode('utf-8')
+
+        response = client.post("/api/predict", json={
+            "image": test_img,
+            "use_stabilizer": True
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert "stabilized" in data
+        if data["stabilized"] is not None:
+            assert "status_reason" in data["stabilized"]
+            assert data["stabilized"]["status_reason"] in [
+                "accepted", "low_confidence", "held_duplicate",
+                "cooldown_active", "stabilizing", "unstable", "no_hand", "neutral"
+            ]
+
+
+class TestPreprocessingPipelineRegression:
+    """Regression tests for RGB/BGR handling, normalization, dimensions, handedness, and class mappings."""
+
+    def test_rgb_bgr_handling(self):
+        """Verify that BGR input crops are accurately mapped to RGB channels."""
+        detector = get_hand_detector_stream()
+        if detector is None:
+            pytest.skip("Hand detector not available")
+
+        # 1. Pure Blue crop in BGR format: B=255, G=0, R=0
+        blue_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
+        blue_bgr[:, :, 0] = 255  # Blue channel in BGR
+
+        t_blue, _ = detector.preprocess_for_inference(blue_bgr, flip_horizontal=False)
+        # In RGB tensor: Channel 0 is R (0.0), Channel 1 is G (0.0), Channel 2 is B (1.0)
+        # Check normalized values
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        expected_r_norm = (0.0 - mean[0]) / std[0]
+        expected_b_norm = (1.0 - mean[2]) / std[2]
+
+        assert abs(t_blue[0, 0, 50, 50].item() - expected_r_norm) < 1e-3
+        assert abs(t_blue[0, 2, 50, 50].item() - expected_b_norm) < 1e-3
+
+        # 2. Pure Red crop in BGR format: B=0, G=0, R=255
+        red_bgr = np.zeros((100, 100, 3), dtype=np.uint8)
+        red_bgr[:, :, 2] = 255  # Red channel in BGR
+
+        t_red, _ = detector.preprocess_for_inference(red_bgr, flip_horizontal=False)
+        # In RGB tensor: Channel 0 is R (1.0), Channel 2 is B (0.0)
+        expected_r_high = (1.0 - mean[0]) / std[0]
+        expected_b_low = (0.0 - mean[2]) / std[2]
+
+        assert abs(t_red[0, 0, 50, 50].item() - expected_r_high) < 1e-3
+        assert abs(t_red[0, 2, 50, 50].item() - expected_b_low) < 1e-3
+
+    def test_normalization_exact_values(self):
+        """Verify normalization matches ImageNet (x - mean) / std to floating-point precision."""
+        detector = get_hand_detector_stream()
+        if detector is None:
+            pytest.skip("Hand detector not available")
+
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+
+        # Test all-zeros (black)
+        black_bgr = np.zeros((128, 128, 3), dtype=np.uint8)
+        t_black, _ = detector.preprocess_for_inference(black_bgr, flip_horizontal=False)
+        for c in range(3):
+            expected = (0.0 - mean[c]) / std[c]
+            assert torch.allclose(t_black[0, c], torch.tensor(expected, dtype=torch.float32), atol=1e-4)
+
+        # Test all-255 (white)
+        white_bgr = np.full((128, 128, 3), 255, dtype=np.uint8)
+        t_white, _ = detector.preprocess_for_inference(white_bgr, flip_horizontal=False)
+        for c in range(3):
+            expected = (1.0 - mean[c]) / std[c]
+            assert torch.allclose(t_white[0, c], torch.tensor(expected, dtype=torch.float32), atol=1e-4)
+
+    def test_input_tensor_dimensions_invariant(self):
+        """Verify output tensor is strictly (1, 3, 128, 128) for arbitrary square input sizes."""
+        detector = get_hand_detector_stream()
+        if detector is None:
+            pytest.skip("Hand detector not available")
+
+        test_sizes = [64, 98, 142, 200, 256, 400]
+        for s in test_sizes:
+            crop = np.random.randint(0, 256, (s, s, 3), dtype=np.uint8)
+            t, meta = detector.preprocess_for_inference(crop)
+            assert t.shape == (1, 3, 128, 128), f"Failed for input size {s}x{s}"
+            assert t.dtype == torch.float32
+
+    def test_handedness_normalization_reflection(self):
+        """Verify flip_horizontal reflects tensor horizontally (width axis) identically to torch.flip."""
+        detector = get_hand_detector_stream()
+        if detector is None:
+            pytest.skip("Hand detector not available")
+
+        # Asymmetric ramp across columns
+        ramp = np.tile(np.linspace(0, 255, 128, dtype=np.uint8), (128, 1))
+        crop = cv2.merge([ramp, ramp // 2, 255 - ramp])
+
+        t_no_flip, _ = detector.preprocess_for_inference(crop, flip_horizontal=False)
+        t_flip, _ = detector.preprocess_for_inference(crop, flip_horizontal=True)
+
+        expected_flipped = torch.flip(t_no_flip, dims=[3])
+        assert torch.allclose(t_flip, expected_flipped, atol=1e-5)
+
+    def test_class_index_mapping_integrity(self):
+        """Verify all 29 classes map strictly between index, string label, and model logits."""
+        loader = get_model_loader()
+        classes = loader.get_info()["classes"]
+        assert len(classes) == 29
+
+        expected_classes = [
+            'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+            'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+            'del', 'nothing', 'space'
+        ]
+        assert classes == expected_classes
+
+        # Verify synthetic one-hot logits map to correct class label for every class
+        for idx, expected_label in enumerate(classes):
+            one_hot_logits = torch.zeros(1, 29)
+            one_hot_logits[0, idx] = 50.0  # Dominant logit
+            probs = torch.softmax(one_hot_logits, dim=1)
+            pred_idx = torch.argmax(probs, dim=1).item()
+            assert pred_idx == idx
+            assert classes[pred_idx] == expected_label
+
+    def test_low_confidence_never_inserted_into_buffer(self):
+        """Regression test: predictions below 0.70 confidence are never inserted into text buffer."""
+        buffer = TextBuffer()
+        stabilizer = PredictionStabilizer(confidence_threshold=0.70, min_consistent=3)
+
+        # Feed 5 consecutive predictions of 'A', but at 0.55 confidence (below 0.70)
+        for _ in range(5):
+            res = stabilizer.process("A", 0.55)
+            assert res.is_stable is False
+            assert res.status_reason == "low_confidence"
+            if res.is_stable and res.action.value == "append":
+                buffer.append(res.character)
+
+        # Buffer must remain strictly empty
+        assert buffer.get_text() == ""
 
 
 if __name__ == "__main__":

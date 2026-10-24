@@ -74,6 +74,18 @@ export function ModelInfo({ className = '' }: ModelInfoProps) {
 
       <div className="info-grid">
         <div className="info-row">
+          <span className="info-label">Active Model</span>
+          <span className="info-value info-value--mono" style={{ fontSize: '11px' }}>
+            {health.checkpoint_name || 'checkpoint_best.pth'}
+          </span>
+        </div>
+        <div className="info-row">
+          <span className="info-label">Provenance</span>
+          <span className="info-value info-value--accent" style={{ fontSize: '11px' }}>
+            {health.checkpoint_type || 'Original (Baseline Kaggle)'}
+          </span>
+        </div>
+        <div className="info-row">
           <span className="info-label">Architecture</span>
           <span className="info-value info-value--mono">Custom PyTorch CNN</span>
         </div>
@@ -166,6 +178,19 @@ export function ModelInfo({ className = '' }: ModelInfoProps) {
           ))}
         </div>
       </details>
+
+      <div style={{
+        marginTop: 'var(--space-4)',
+        padding: 'var(--space-3)',
+        background: 'rgba(245, 158, 11, 0.08)',
+        border: '1px solid rgba(245, 158, 11, 0.35)',
+        borderRadius: 'var(--radius-sm)',
+        fontSize: 'var(--font-size-xs)',
+        lineHeight: 'var(--line-height-relaxed)',
+        color: 'var(--color-text-secondary)',
+      }}>
+        <strong style={{ color: 'var(--color-warning)' }}>Motion Gestures (J & Z):</strong> In ASL, letters <strong>J</strong> and <strong>Z</strong> require trajectory movement in the air. The CNN performs static 2D classification on single frames; recognition of J and Z in static mode is limited.
+      </div>
 
       <p style={{
         marginTop: 'var(--space-4)',

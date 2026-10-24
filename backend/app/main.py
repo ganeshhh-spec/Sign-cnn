@@ -90,6 +90,8 @@ class HealthResponse(BaseModel):
     gpu_available: bool
     gpu_name: Optional[str] = None
     model_load_time_seconds: float
+    checkpoint_name: Optional[str] = None
+    checkpoint_type: Optional[str] = None
 
 
 class PredictRequest(BaseModel):
@@ -97,6 +99,7 @@ class PredictRequest(BaseModel):
     use_stabilizer: bool = Field(True, description="Apply prediction stabilization")
     return_top_k: int = Field(3, ge=1, le=5, description="Number of top predictions to return")
     capture_debug_crop: bool = Field(False, description="Save up to 12 exact inference crops for this backend run")
+    enable_osn: bool = Field(False, description="Apply landmark-guided Orientation and Scale Normalization (OSN)")
 
 
 class PredictionItem(BaseModel):
@@ -113,6 +116,7 @@ class StabilizedPredictionResponse(BaseModel):
     is_stable: bool
     raw_prediction: str
     raw_confidence: float
+    status_reason: Optional[str] = None
 
 
 class TrackingDiagnostics(BaseModel):
@@ -125,6 +129,9 @@ class TrackingDiagnostics(BaseModel):
     crop_bounds: Optional[Dict[str, int]] = None
     frame_size: Optional[Dict[str, int]] = None
     handedness_normalized: bool = False
+    osn_applied: bool = False
+    osn_rotation_deg: float = 0.0
+    osn_hand_coverage_pct: float = 0.0
 
 
 class PredictResponse(BaseModel):
@@ -145,6 +152,13 @@ class PredictResponse(BaseModel):
 class TextBufferResponse(BaseModel):
     text: str
     length: int
+
+
+class StabilizerConfigRequest(BaseModel):
+    confidence_threshold: Optional[float] = Field(None, ge=0.1, le=0.99, description="Confidence threshold (0.1 - 0.99)")
+    min_consistent: Optional[int] = Field(None, ge=1, le=10, description="Minimum consecutive consistent frames (1 - 10)")
+    cooldown_seconds: Optional[float] = Field(None, ge=0.0, le=5.0, description="Cooldown between different letters (seconds)")
+    duplicate_guard: Optional[bool] = Field(None, description="Prevent duplicate append while holding same gesture")
 
 
 class ErrorResponse(BaseModel):
@@ -263,7 +277,9 @@ async def health_check(model=Depends(get_model)):
         num_classes=info["num_classes"],
         gpu_available=torch.cuda.is_available(),
         gpu_name=gpu_name,
-        model_load_time_seconds=info["load_time_seconds"]
+        model_load_time_seconds=info["load_time_seconds"],
+        checkpoint_name=info.get("checkpoint_name"),
+        checkpoint_type=info.get("checkpoint_type")
     )
 
 
@@ -327,8 +343,13 @@ async def predict(
         # Use first detected hand (highest confidence)
         best_detection = max(detections, key=lambda d: d["confidence"])
         
-        # Crop hand
-        hand_crop = detector.crop_hand(frame, best_detection["bbox"])
+        # Crop hand (supports optional landmark-guided OSN)
+        hand_crop = detector.crop_hand(
+            frame,
+            best_detection["bbox"],
+            landmarks=best_detection.get("landmarks"),
+            use_osn=request.enable_osn
+        )
         if hand_crop is None:
             if request.use_stabilizer:
                 stabilizer.process_no_hand()
@@ -455,7 +476,8 @@ async def predict(
                 confidence=stabilized.confidence,
                 is_stable=stabilized.is_stable,
                 raw_prediction=stabilized.raw_prediction,
-                raw_confidence=stabilized.raw_confidence
+                raw_confidence=stabilized.raw_confidence,
+                status_reason=getattr(stabilized, "status_reason", "none")
             )
         elif request.use_stabilizer and not top_predictions:
             stabilized = stabilizer.process_no_hand()
@@ -465,11 +487,13 @@ async def predict(
                 confidence=stabilized.confidence,
                 is_stable=stabilized.is_stable,
                 raw_prediction=stabilized.raw_prediction,
-                raw_confidence=stabilized.raw_confidence
+                raw_confidence=stabilized.raw_confidence,
+                status_reason=getattr(stabilized, "status_reason", "no_hand")
             )
         
         total_time = (time.time() - total_start) * 1000
         
+        osn_diag = detector.get_last_osn_diagnostics() if detector is not None else {}
         tracking_diag = TrackingDiagnostics(
             landmarks_count=best_detection.get("landmarks_count", 21),
             tracking_confidence=round(best_detection.get("confidence", 0.0), 3),
@@ -484,7 +508,10 @@ async def predict(
             ),
             crop_bounds=best_detection.get("bbox"),
             frame_size=best_detection.get("frame_size"),
-            handedness_normalized=normalize_handedness
+            handedness_normalized=normalize_handedness,
+            osn_applied=osn_diag.get("osn_applied", False),
+            osn_rotation_deg=osn_diag.get("rotation_deg", 0.0),
+            osn_hand_coverage_pct=osn_diag.get("hand_coverage_pct", 0.0)
         )
         
         return PredictResponse(
@@ -571,6 +598,64 @@ async def get_translation_state(
 async def get_preprocessing_config(model=Depends(get_model)):
     """Get preprocessing configuration used by the model."""
     return model.get_preprocessing_config()
+
+
+@app.get("/api/stabilizer/config")
+async def get_stabilizer_config(stabilizer=Depends(get_stabilizer_service)):
+    """Get current prediction stabilizer configuration and calibration rationale."""
+    return stabilizer.get_config()
+
+
+@app.post("/api/stabilizer/config")
+async def update_stabilizer_config(
+    request: StabilizerConfigRequest,
+    stabilizer=Depends(get_stabilizer_service)
+):
+    """Update prediction stabilizer configuration."""
+    stabilizer.update_config(
+        confidence_threshold=request.confidence_threshold,
+        min_consistent=request.min_consistent,
+        cooldown_seconds=request.cooldown_seconds,
+        duplicate_guard=request.duplicate_guard,
+    )
+    return {"success": True, "config": stabilizer.get_config()}
+
+
+@app.get("/api/samples")
+async def get_verified_samples():
+    """
+    Returns list of verified physical webcam sample gestures for reliable demo mode.
+    Includes base64 images of priority demo letters (A, B, C, E, H, L, P) and others.
+    """
+    samples_dir = Path(__file__).resolve().parents[2] / "data" / "webcam_augmented" / "val"
+    fallback_dir = Path(__file__).resolve().parents[2] / "data" / "webcam_captures"
+    search_dir = samples_dir if samples_dir.exists() else fallback_dir
+
+    demo_letters = ["A", "B", "C", "E", "H", "L", "P"]
+    result = []
+
+    if search_dir.exists():
+        for letter in sorted(list(set(demo_letters + [d.name for d in search_dir.iterdir() if d.is_dir()]))):
+            cls_dir = search_dir / letter
+            if not cls_dir.is_dir():
+                continue
+            jpgs = sorted(list(cls_dir.glob("*.jpg")))
+            if not jpgs:
+                continue
+            sample_path = jpgs[0]
+            try:
+                with open(sample_path, "rb") as img_f:
+                    b64 = base64.b64encode(img_f.read()).decode("utf-8")
+                result.append({
+                    "class_label": letter,
+                    "filename": sample_path.name,
+                    "is_priority_demo": (letter in demo_letters),
+                    "image_base64": b64,
+                })
+            except Exception:
+                continue
+
+    return {"samples": result, "count": len(result)}
 
 
 # Global exception handler

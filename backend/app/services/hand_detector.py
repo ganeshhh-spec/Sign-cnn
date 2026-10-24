@@ -6,6 +6,8 @@ Locates hand, crops region, and applies training-compatible preprocessing.
 import cv2
 import numpy as np
 import torch
+import math
+import os
 from typing import Optional, Tuple, List, Dict
 from pathlib import Path
 import sys
@@ -130,7 +132,11 @@ class HandDetector:
         min_tracking_confidence: float = 0.5,
         static_image_mode: bool = False,
         expand_ratio: float = 1.20,
-        enable_smoothing: bool = True
+        enable_smoothing: bool = True,
+        enable_osn: bool = False,
+        osn_scale_factor: float = 2.0,
+        osn_wrist_y_ratio: float = 0.82,
+        osn_max_rotation_deg: float = 45.0
     ):
         if not MEDIAPIPE_AVAILABLE:
             raise RuntimeError("MediaPipe not available")
@@ -144,7 +150,15 @@ class HandDetector:
         self.smoother = BoundingBoxSmoother()
         self.last_crop_padded = False
         self.last_crop_diagnostics: Dict = {}
+        self.last_osn_diagnostics: Dict = {}
         self._lock = threading.RLock()
+
+        # OSN Configuration (optional landmark-guided orientation and scale normalization)
+        env_osn = os.environ.get("ASL_ENABLE_OSN", "").strip().lower() in ("1", "true", "yes")
+        self.enable_osn = enable_osn or env_osn
+        self.osn_scale_factor = osn_scale_factor
+        self.osn_wrist_y_ratio = osn_wrist_y_ratio
+        self.osn_max_rotation_deg = osn_max_rotation_deg
         
         # Check model file exists
         model_path = self._get_model_path()
@@ -296,23 +310,51 @@ class HandDetector:
         
             return detections
     
-    def crop_hand(self, frame: np.ndarray, bbox: Dict) -> Optional[np.ndarray]:
+    def crop_hand(
+        self,
+        frame: np.ndarray,
+        bbox: Dict,
+        landmarks: Optional[List] = None,
+        use_osn: Optional[bool] = None,
+    ) -> Optional[np.ndarray]:
         """
         Crop hand region from frame, guaranteeing a square output.
-        Pads with black (zeros) if the square extends outside frame boundaries.
+        If use_osn (or self.enable_osn) is True and landmarks are provided,
+        applies landmark-guided Orientation and Scale Normalization (OSN).
+        Falls back seamlessly to the standard square bounding box crop if
+        OSN is disabled, unavailable, or degenerate.
         
         Args:
             frame: BGR image
             bbox: Bounding box dict with x_min, y_min, x_max, y_max
+            landmarks: Optional list of MediaPipe landmarks
+            use_osn: Optional override flag to enable/disable OSN for this frame
             
         Returns:
             Square cropped BGR image or None if invalid
         """
+        should_use_osn = (use_osn if use_osn is not None else self.enable_osn)
+        if should_use_osn and landmarks is not None:
+            osn_crop, osn_diag = self.crop_hand_osn(frame, landmarks)
+            if osn_crop is not None:
+                self.last_crop_padded = False
+                self.last_crop_diagnostics = {
+                    "bbox": dict(bbox),
+                    "frame_size": {"width": frame.shape[1], "height": frame.shape[0]},
+                    "fully_within_frame": True,
+                    "padding_applied": False,
+                    "crop_size": osn_crop.shape[0],
+                    "valid": True,
+                    "osn_applied": True,
+                    "osn_diagnostics": osn_diag,
+                }
+                return osn_crop
+
         x_min, y_min = bbox["x_min"], bbox["y_min"]
         x_max, y_max = bbox["x_max"], bbox["y_max"]
         
         # Validate bbox
-        self.last_crop_diagnostics = {"bbox": dict(bbox), "valid": False}
+        self.last_crop_diagnostics = {"bbox": dict(bbox), "valid": False, "osn_applied": False}
         if x_max <= x_min or y_max <= y_min:
             return None
         
@@ -338,6 +380,7 @@ class HandDetector:
                 "bbox": dict(bbox), "frame_size": {"width": fw, "height": fh},
                 "fully_within_frame": True, "padding_applied": False,
                 "crop_size": crop_w, "valid": True,
+                "osn_applied": False,
             }
             return src_crop if src_crop.size > 0 else None
             
@@ -365,11 +408,136 @@ class HandDetector:
                 "bbox": dict(bbox), "frame_size": {"width": fw, "height": fh},
                 "fully_within_frame": False, "padding_applied": True,
                 "crop_size": target_side, "valid": True,
+                "osn_applied": False,
             }
             return square_crop
             
         self.last_crop_padded = False
         return src_crop if src_crop.size > 0 else None
+
+    def crop_hand_osn(
+        self,
+        frame: np.ndarray,
+        landmarks,
+        scale_factor: Optional[float] = None,
+        wrist_y_ratio: Optional[float] = None,
+        max_rotation_deg: Optional[float] = None,
+    ) -> Tuple[Optional[np.ndarray], Dict]:
+        """
+        Landmark-guided Orientation and Scale Normalization (OSN).
+        
+        1. Computes hand tilt angle using wrist (landmark 0) and middle MCP (landmark 9).
+        2. Clamps rotation angle to max_rotation_deg to avoid distorting naturally non-vertical signs.
+        3. Rotates raw frame so palm axis is aligned upright.
+        4. Scales and pads bounding box using detected hand landmarks (scale_factor ~ 2.0x, wrist at ~82% height).
+        5. Returns normalized crop and metadata.
+        Falls back to None if landmarks are degenerate or missing.
+        """
+        sf = scale_factor if scale_factor is not None else self.osn_scale_factor
+        wyr = wrist_y_ratio if wrist_y_ratio is not None else self.osn_wrist_y_ratio
+        max_rot = max_rotation_deg if max_rotation_deg is not None else self.osn_max_rotation_deg
+        
+        diag = {
+            "osn_applied": False,
+            "fallback_reason": None,
+            "rotation_deg": 0.0,
+            "scale_factor": sf,
+            "wrist_y_ratio": wyr,
+        }
+        
+        if landmarks is None or len(landmarks) < 21:
+            diag["fallback_reason"] = "Insufficient landmarks (< 21)"
+            self.last_osn_diagnostics = diag
+            return None, diag
+            
+        fh, fw = frame.shape[:2]
+        try:
+            lm_pts = np.array([(lm.x * fw, lm.y * fh) for lm in landmarks], dtype=np.float32)
+            wrist = lm_pts[0]
+            middle_mcp = lm_pts[9]
+            
+            dx = float(middle_mcp[0] - wrist[0])
+            dy = float(middle_mcp[1] - wrist[1])
+            dist = (dx * dx + dy * dy) ** 0.5
+            
+            if dist < 5.0:
+                diag["fallback_reason"] = f"Degenerate wrist-MCP distance ({dist:.1f}px < 5.0px)"
+                self.last_osn_diagnostics = diag
+                return None, diag
+                
+            # Angle in image coordinates (-90 is straight up)
+            theta = math.degrees(math.atan2(dy, dx))
+            raw_rot = theta + 90.0
+            while raw_rot > 180.0:
+                raw_rot -= 360.0
+            while raw_rot < -180.0:
+                raw_rot += 360.0
+                
+            # Clamp rotation to safety limit to preserve naturally tilted / horizontal signs
+            if max_rot > 0.0:
+                clamped_rot = max(-max_rot, min(max_rot, raw_rot))
+            else:
+                clamped_rot = 0.0
+                
+            diag["raw_rotation_deg"] = round(raw_rot, 2)
+            diag["clamped_rotation_deg"] = round(clamped_rot, 2)
+            diag["rotation_deg"] = round(clamped_rot, 2)
+            
+            # Rotate raw frame around hand center
+            cx = float(lm_pts[:, 0].mean())
+            cy = float(lm_pts[:, 1].mean())
+            
+            M = cv2.getRotationMatrix2D((cx, cy), clamped_rot, 1.0)
+            rotated_frame = cv2.warpAffine(frame, M, (fw, fh), borderMode=cv2.BORDER_REFLECT)
+            
+            # Transform landmarks into rotated coordinate system
+            rotated_pts = cv2.transform(lm_pts.reshape(-1, 1, 2), M).reshape(-1, 2)
+            rx_min, ry_min = rotated_pts.min(axis=0)
+            rx_max, ry_max = rotated_pts.max(axis=0)
+            
+            rw = rx_max - rx_min
+            rh = ry_max - ry_min
+            hand_size = max(rw, rh)
+            
+            box_side = int(round(hand_size * sf))
+            if box_side < 20:
+                diag["fallback_reason"] = f"Degenerate box size ({box_side}px < 20px)"
+                self.last_osn_diagnostics = diag
+                return None, diag
+                
+            # Position box so wrist is at wrist_y_ratio height (e.g. 82% from top, near bottom margin)
+            rwrist_y = float(rotated_pts[0, 1])
+            rcx = float((rx_min + rx_max) / 2.0)
+            
+            y2 = int(round(rwrist_y + box_side * (1.0 - wyr)))
+            y1 = y2 - box_side
+            x1 = int(round(rcx - box_side / 2.0))
+            x2 = x1 + box_side
+            
+            # Destination canvas
+            crop = np.zeros((box_side, box_side, 3), dtype=frame.dtype)
+            src_x1, src_x2 = max(0, x1), min(fw, x2)
+            src_y1, src_y2 = max(0, y1), min(fh, y2)
+            dst_x1, dst_y1 = max(0, -x1), max(0, -y1)
+            dst_x2 = dst_x1 + (src_x2 - src_x1)
+            dst_y2 = dst_y1 + (src_y2 - src_y1)
+            
+            if (src_x2 > src_x1) and (src_y2 > src_y1) and (dst_x2 > dst_x1) and (dst_y2 > dst_y1):
+                crop[dst_y1:dst_y2, dst_x1:dst_x2] = rotated_frame[src_y1:src_y2, src_x1:src_x2]
+                diag["osn_applied"] = True
+                diag["box_side"] = box_side
+                diag["hand_size"] = round(float(hand_size), 1)
+                diag["hand_coverage_pct"] = round(float(hand_size / box_side * 100), 1)
+                self.last_osn_diagnostics = diag
+                return crop, diag
+            else:
+                diag["fallback_reason"] = "Crop bounding box out of bounds"
+                self.last_osn_diagnostics = diag
+                return None, diag
+        except Exception as e:
+            diag["fallback_reason"] = f"Exception: {str(e)}"
+            self.last_osn_diagnostics = diag
+            return None, diag
 
     def was_last_crop_padded(self) -> bool:
         """Check whether the most recent crop required zero-padding."""
@@ -378,6 +546,10 @@ class HandDetector:
     def get_last_crop_diagnostics(self) -> Dict:
         """Return metadata for the exact crop supplied to CNN inference."""
         return dict(self.last_crop_diagnostics)
+
+    def get_last_osn_diagnostics(self) -> Dict:
+        """Return metadata for landmark-guided orientation and scale normalization."""
+        return dict(self.last_osn_diagnostics)
 
     def reset_tracking(self):
         """Reset temporal smoother and tracking state."""

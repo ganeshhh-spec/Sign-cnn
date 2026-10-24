@@ -251,14 +251,22 @@
   flex-shrink: 0;
 }
 
+/* Dedicated tracking coordinate layer matching video 1:1 with zero padding */
+.camera-tracking-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 1;
+}
+
 /* Signing Guide Overlay */
 .signing-guide-box {
   position: absolute;
   top: 14%;
-  right: 6%;
-  width: 38%;
-  height: 60%;
-  border: 2px dashed rgba(245, 158, 11, 0.4);
+  width: 40%;
+  height: 62%;
+  border: 2px dashed rgba(245, 158, 11, 0.45);
   border-radius: var(--radius-md);
   background: rgba(245, 158, 11, 0.03);
   pointer-events: none;
@@ -266,12 +274,25 @@
   flex-direction: column;
   align-items: center;
   padding-top: var(--space-2);
-  transition: all var(--transition-fast);
+  transition: left var(--transition-fast), right var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+}
+
+/* Left-hand signing position (left side of mirrored preview) */
+.signing-guide-box--left {
+  left: 6%;
+  right: auto;
+}
+
+/* Right-hand signing position (right side of mirrored preview) */
+.signing-guide-box--right {
+  right: 6%;
+  left: auto;
 }
 
 .signing-guide-box--active {
-  border-color: rgba(16, 185, 129, 0.65);
-  background: rgba(16, 185, 129, 0.04);
+  border-color: rgba(16, 185, 129, 0.75);
+  background: rgba(16, 185, 129, 0.06);
+  box-shadow: 0 0 16px rgba(16, 185, 129, 0.15);
 }
 
 .signing-guide-label {
@@ -285,6 +306,34 @@
   border-radius: var(--radius-sm);
   border: 1px solid var(--color-border);
   text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.camera-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: var(--space-2);
+}
+
+.hand-selector {
+  display: flex;
+  gap: 2px;
+  background: rgba(15, 15, 15, 0.85);
+  backdrop-filter: blur(8px);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  padding: 2px;
+  pointer-events: auto;
+}
+
+.btn--xs {
+  padding: 3px 8px;
+  font-size: 10px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  line-height: 1;
 }
 
 .signing-hint {

@@ -1,8 +1,10 @@
 """
 Model loading and inference service for ASL CNN.
 Loads checkpoint with weights_only=True for safety.
+Reports checkpoint provenance and metadata.
 """
 
+import os
 import torch
 import json
 from pathlib import Path
@@ -19,7 +21,9 @@ class ModelLoader:
     """Handles model loading, checkpoint verification, and inference."""
     
     def __init__(self, checkpoint_path: str = None, device: str = None):
-        self.checkpoint_path = checkpoint_path or str(PROJECT_ROOT / "results" / "models" / "checkpoint_best.pth")
+        env_ckpt = os.environ.get("ASL_CHECKPOINT_PATH")
+        default_ckpt = str(PROJECT_ROOT / "results" / "models" / "checkpoint_best.pth")
+        self.checkpoint_path = checkpoint_path or env_ckpt or default_ckpt
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model: Optional[ASLCNN] = None
         self.classes: List[str] = []
@@ -30,6 +34,27 @@ class ModelLoader:
         self.input_size = (3, 128, 128)
         self._loaded = False
         self._load_time = 0.0
+        self.checkpoint_name = Path(self.checkpoint_path).name
+        self.checkpoint_type = self._identify_checkpoint_type()
+
+    def _identify_checkpoint_type(self) -> str:
+        """Identify whether loaded model is the Original Baseline or Fine-Tuned Candidate."""
+        p = Path(self.checkpoint_path)
+        if not p.exists():
+            return "File Not Found"
+        try:
+            size = p.stat().st_size
+            # Original checkpoint is ~5,136,434 bytes (includes optimizer/scaler states)
+            # Candidate checkpoint is ~1,716,962 bytes (model_state_dict + metadata)
+            if "finetuned" in p.name.lower() or "balanced" in p.name.lower():
+                return "Fine-Tuned (Balanced Candidate)"
+            if abs(size - 5136434) < 4096 or "backup" in p.name.lower():
+                return "Original (Baseline Kaggle)"
+            if abs(size - 1716962) < 4096:
+                return "Fine-Tuned (Balanced Candidate)"
+            return "Custom Checkpoint"
+        except Exception:
+            return "Unknown"
     
     def load(self) -> bool:
         """Load model checkpoint and metadata."""
@@ -53,6 +78,8 @@ class ModelLoader:
             
             # Load checkpoint with weights_only=True for safety
             checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
+            self.checkpoint_name = Path(self.checkpoint_path).name
+            self.checkpoint_type = self._identify_checkpoint_type()
             
             # Create model and load weights
             num_classes = len(self.classes) if self.classes else 29
@@ -69,6 +96,7 @@ class ModelLoader:
             self._loaded = True
             self._load_time = time.time() - start
             print(f"Model loaded successfully on {self.device} in {self._load_time:.3f}s")
+            print(f"Checkpoint: {self.checkpoint_name} [{self.checkpoint_type}]")
             print(f"Classes: {len(self.classes)}, Output shape: {output.shape}")
             return True
             
@@ -123,6 +151,8 @@ class ModelLoader:
             "input_size": self.input_size,
             "load_time_seconds": round(self._load_time, 3),
             "checkpoint_path": self.checkpoint_path,
+            "checkpoint_name": self.checkpoint_name,
+            "checkpoint_type": self.checkpoint_type,
             "normalization": {
                 "mean": self.normalization_mean,
                 "std": self.normalization_std

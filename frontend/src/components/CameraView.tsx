@@ -1,11 +1,12 @@
 /**
- * CameraView - Live webcam preview with hand detection overlay
+ * CameraView - Live webcam preview with hand detection overlay,
+ * responsive signing zone guide, and deterministic verified sample demo mode.
  */
 
 import { useEffect, useState, useRef } from 'react';
 import { useCamera, type CameraState } from '../hooks/useCamera';
 import { api } from '@/api/client';
-import type { PredictResponse } from '@/types/api';
+import type { PredictResponse, SampleGesture } from '@/types/api';
 import './camera.css';
 
 interface CameraViewProps {
@@ -16,12 +17,28 @@ interface CameraViewProps {
   onCaptureDebugCropChange: (enabled: boolean) => void;
 }
 
-export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugCrop, onCaptureDebugCropChange }: CameraViewProps) {
+export function CameraView({
+  onFrame,
+  onPrediction,
+  useStabilizer,
+  captureDebugCrop,
+  onCaptureDebugCropChange,
+}: CameraViewProps) {
   const [handDetected, setHandDetected] = useState(false);
   const [handBBox, setHandBBox] = useState<PredictResponse['hand_bbox']>(null);
   const [handHandedness, setHandHandedness] = useState<string | null>(null);
   const [trackingDiag, setTrackingDiag] = useState<PredictResponse['tracking_diagnostics']>(null);
   const [lastLatency, setLastLatency] = useState(0);
+
+  // Signing hand preference: 'auto' | 'left' | 'right'
+  // Defaults to 'auto', which adopts 'left' for left-handed signers (matching recording)
+  const [signingHandPref, setSigningHandPref] = useState<'auto' | 'left' | 'right'>('auto');
+
+  // Sample mode state
+  const [sampleMode, setSampleMode] = useState(false);
+  const [samples, setSamples] = useState<SampleGesture[]>([]);
+  const [selectedSample, setSelectedSample] = useState<string | null>(null);
+  const [loadingSample, setLoadingSample] = useState(false);
 
   const isPredictingRef = useRef(false);
   const useStabilizerRef = useRef(useStabilizer);
@@ -29,6 +46,17 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
   useEffect(() => {
     useStabilizerRef.current = useStabilizer;
   }, [useStabilizer]);
+
+  // Load verified samples when entering sample mode
+  useEffect(() => {
+    if (sampleMode && samples.length === 0) {
+      api.getSamples().then((res) => {
+        setSamples(res.samples);
+      }).catch((err) => {
+        console.error('[CameraView] Failed to load verified samples:', err);
+      });
+    }
+  }, [sampleMode, samples.length]);
 
   const {
     state,
@@ -42,10 +70,13 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
     setFrameCallback,
   } = useCamera({ targetFps: 10 });
 
-  // Set up frame callback
+  // Set up live frame callback
   useEffect(() => {
     setFrameCallback(async (frame) => {
       onFrame(frame);
+
+      // If in sample mode, don't run camera prediction
+      if (sampleMode) return;
 
       // Send to backend for prediction
       if (!isPredictingRef.current) {
@@ -70,9 +101,10 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
         }
       }
     });
-  }, [onFrame, onPrediction, setFrameCallback, captureDebugCrop]);
+  }, [onFrame, onPrediction, setFrameCallback, captureDebugCrop, sampleMode]);
 
   const handleStart = async () => {
+    setSampleMode(false);
     await start();
   };
 
@@ -88,20 +120,145 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
     await switchCamera(deviceId);
   };
 
+  const handleTestSample = async (sample: SampleGesture) => {
+    setSelectedSample(sample.class_label);
+    setLoadingSample(true);
+    try {
+      const response = await api.predict({
+        image: sample.image_base64,
+        use_stabilizer: useStabilizerRef.current,
+        return_top_k: 3,
+        capture_debug_crop: false,
+      });
+      setHandDetected(response.hand_detected);
+      setHandBBox(response.hand_bbox);
+      setHandHandedness(response.hand_handedness);
+      setTrackingDiag(response.tracking_diagnostics ?? null);
+      onPrediction(response);
+      setLastLatency(response.total_time_ms);
+    } catch (e) {
+      console.error('[CameraView] Sample prediction failed:', e);
+    } finally {
+      setLoadingSample(false);
+    }
+  };
+
+  // Effective signing hand: defaults to 'left' to align with user's recording, but auto-adapts when right hand is detected
+  const effectiveSigningSide =
+    signingHandPref !== 'auto'
+      ? signingHandPref
+      : handHandedness === 'Right'
+      ? 'right'
+      : 'left';
+
+  const frameW = trackingDiag?.frame_size?.width ?? 640;
+  const frameH = trackingDiag?.frame_size?.height ?? 480;
+
+  // Mirrored hand bbox coordinates in %
+  const handLeft = handBBox ? 100 - (handBBox.x_max / frameW) * 100 : 0;
+  const handRight = handBBox ? 100 - (handBBox.x_min / frameW) * 100 : 0;
+  const handTop = handBBox ? (handBBox.y_min / frameH) * 100 : 0;
+  const handBottom = handBBox ? (handBBox.y_max / frameH) * 100 : 0;
+
+  const handCenterX = (handLeft + handRight) / 2;
+  const handCenterY = (handTop + handBottom) / 2;
+
+  // Active guide zone boundaries in % (left: 6-46%, right: 54-94%, top: 14-76%)
+  const zoneLeft = effectiveSigningSide === 'left' ? 6 : 54;
+  const zoneRight = effectiveSigningSide === 'left' ? 46 : 94;
+  const zoneTop = 14;
+  const zoneBottom = 76;
+
+  // Hand is in zone if its center is inside the active signing guide box
+  const isHandInZone = Boolean(
+    handDetected &&
+    handBBox &&
+    handCenterX >= zoneLeft - 5 &&
+    handCenterX <= zoneRight + 5 &&
+    handCenterY >= zoneTop - 5 &&
+    handCenterY <= zoneBottom + 10
+  );
+
+  // Determine hint message based on edge proximity and tracking
+  const getHintMessage = () => {
+    if (sampleMode) {
+      return 'SAMPLE MODE: Click a verified gesture below to test without camera noise';
+    }
+    if (!handDetected) {
+      return `Position ${effectiveSigningSide === 'left' ? 'left' : 'right'} hand upright in the signing zone away from face`;
+    }
+    if (!isHandInZone) {
+      return `Move hand into the ${effectiveSigningSide === 'left' ? 'left' : 'right'} signing zone (clear of face)`;
+    }
+    if (trackingDiag?.crop_touches_frame_edge) {
+      return '⚠️ Warning: Hand near frame edge — keep centered in green box';
+    }
+    return 'Hand in signing zone — hold sign steady for 3 frames to append';
+  };
+
   return (
-    <div className={`camera-wrapper ${state !== 'active' ? 'camera-wrapper--no-camera' : ''}`} role="region" aria-label="Camera preview">
-      {/* Video element is ALWAYS mounted to preserve ref and avoid timing race conditions */}
+    <div className={`camera-wrapper ${state !== 'active' && !sampleMode ? 'camera-wrapper--no-camera' : ''}`} role="region" aria-label="Camera preview">
+      {/* Video element is ALWAYS mounted to preserve ref */}
       <video
         ref={videoRef}
         className="camera-video"
         autoPlay
         playsInline
         muted
-        aria-hidden={state !== 'active'}
+        style={{ display: sampleMode ? 'none' : 'block' }}
+        aria-hidden={state !== 'active' || sampleMode}
       />
 
-      {/* Placeholder overlay shown when camera is not actively streaming */}
-      {state !== 'active' && (
+      {/* Sample Mode Preview Canvas */}
+      {sampleMode && (
+        <div style={{
+          position: 'absolute',
+          inset: 0,
+          background: 'var(--color-bg-deep)',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 'var(--space-4)',
+          zIndex: 3,
+        }}>
+          <div style={{
+            fontSize: 'var(--font-size-sm)',
+            fontWeight: 'var(--font-weight-semibold)',
+            color: 'var(--color-accent)',
+            marginBottom: 'var(--space-2)',
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+          }}>
+            Verified Sample Mode (Deterministic Evaluation)
+          </div>
+          <div style={{ fontSize: '11px', color: 'var(--color-text-muted)', marginBottom: 'var(--space-4)', textAlign: 'center', maxWidth: '440px' }}>
+            Click any gesture below to feed a verified physical webcam frame directly to the CNN pipeline:
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center', maxWidth: '520px' }}>
+            {samples.map((s) => (
+              <button
+                key={s.class_label}
+                className={`btn btn--sm ${selectedSample === s.class_label ? 'btn--primary' : 'btn--ghost'}`}
+                onClick={() => handleTestSample(s)}
+                disabled={loadingSample}
+                style={{
+                  fontWeight: 'var(--font-weight-bold)',
+                  minWidth: '42px',
+                  border: selectedSample === s.class_label ? '1px solid var(--color-accent)' : '1px solid var(--color-border)',
+                }}
+              >
+                {s.class_label}
+                {s.is_priority_demo ? ' ★' : ''}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Placeholder overlay shown when camera is not actively streaming and not in sample mode */}
+      {state !== 'active' && !sampleMode && (
         <div className="camera-placeholder">
           {state === 'error' ? (
             <>
@@ -127,53 +284,36 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
                 <path d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1115 0z" />
               </svg>
               <p className="camera-placeholder-text">Click Start Camera to begin</p>
-              <p className="camera-placeholder-hint">Camera permission will be requested</p>
+              <p className="camera-placeholder-hint">Or switch to Sample Mode for instant pre-verified testing</p>
             </>
           )}
         </div>
       )}
 
-      {/* Active overlay for hand detection and status */}
-      {state === 'active' && (
-        <div className="camera-overlay">
-          <div className="camera-status">
-            <span
-              className={`status-indicator ${
-                handDetected ? 'status-indicator--detecting' : 'status-indicator--active'
-              }`}
-              aria-hidden="true"
-            />
-            <span className="status-text">
-              {handDetected
-                ? `Hand Detected${trackingDiag?.landmarks_count ? ` (${trackingDiag.landmarks_count} pts)` : ''}${
-                    trackingDiag?.is_smoothed ? ' • Smoothed' : ''
-                  }`
-                : 'Camera Active'}
-            </span>
-          </div>
-
-          {/* Visual Signing Zone Guide to encourage proper hand positioning away from face */}
+      {/* Dedicated tracking coordinate layer (0 padding, full bleed, exact 1:1 match with video preview) */}
+      {(state === 'active' || sampleMode) && !sampleMode && (
+        <div className="camera-tracking-layer" aria-hidden="true">
+          {/* Visual Signing Zone Guide aligned with intended hand position */}
           <div
-            className={`signing-guide-box ${handDetected ? 'signing-guide-box--active' : ''}`}
-            aria-hidden="true"
+            className={`signing-guide-box signing-guide-box--${effectiveSigningSide} ${
+              isHandInZone ? 'signing-guide-box--active' : ''
+            }`}
           >
             <span className="signing-guide-label">
-              Signing Zone • Upright & Clear of Face
+              Signing Zone ({effectiveSigningSide === 'left' ? 'Left Hand' : 'Right Hand'}) • Clear of Face
             </span>
           </div>
 
+          {/* MediaPipe Hand Bounding Box */}
           {handBBox && (
             <div
               className={`hand-bbox ${trackingDiag?.crop_padding_applied ? 'hand-bbox--padded' : ''}`}
               style={{
-                // Capture frames are 640x480. Percentages keep the actual CNN
-                // crop aligned when the preview scales; x is mirrored with video.
-                left: `${100 - (handBBox.x_max / (trackingDiag?.frame_size?.width ?? 640)) * 100}%`,
-                top: `${(handBBox.y_min / (trackingDiag?.frame_size?.height ?? 480)) * 100}%`,
-                width: `${((handBBox.x_max - handBBox.x_min) / (trackingDiag?.frame_size?.width ?? 640)) * 100}%`,
-                height: `${((handBBox.y_max - handBBox.y_min) / (trackingDiag?.frame_size?.height ?? 480)) * 100}%`,
+                left: `${handLeft}%`,
+                top: `${handTop}%`,
+                width: `${handRight - handLeft}%`,
+                height: `${handBottom - handTop}%`,
               }}
-              aria-hidden="true"
             >
               <span className="hand-label">
                 {handHandedness}
@@ -181,17 +321,62 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
                 {trackingDiag && trackingDiag.tracking_confidence > 0
                   ? ` ${Math.round(trackingDiag.tracking_confidence * 100)}%`
                   : ''}
-                {handDetected ? ' ✓' : ' ...'}
+                {isHandInZone ? ' ✓ In Zone' : ''}
                 {trackingDiag?.crop_padding_applied ? ' • edge padded' : ''}
               </span>
             </div>
           )}
+        </div>
+      )}
+
+      {/* UI overlay for status badges and live hints */}
+      {(state === 'active' || sampleMode) && (
+        <div className="camera-overlay">
+          <div className="camera-status-row">
+            <div className="camera-status">
+              <span
+                className={`status-indicator ${
+                  handDetected ? 'status-indicator--detecting' : 'status-indicator--active'
+                }`}
+                aria-hidden="true"
+              />
+              <span className="status-text">
+                {sampleMode
+                  ? `Sample Mode${selectedSample ? ` [${selectedSample}]` : ''}`
+                  : handDetected
+                  ? `Hand Detected${trackingDiag?.landmarks_count ? ` (${trackingDiag.landmarks_count} pts)` : ''}${
+                      trackingDiag?.is_smoothed ? ' • Smoothed' : ''
+                    }`
+                  : 'Camera Active'}
+              </span>
+            </div>
+
+            {/* Handedness zone quick selector */}
+            {!sampleMode && state === 'active' && (
+              <div className="hand-selector" role="group" aria-label="Signing hand alignment">
+                <button
+                  type="button"
+                  className={`btn btn--xs ${effectiveSigningSide === 'left' ? 'btn--primary' : 'btn--ghost'}`}
+                  onClick={() => setSigningHandPref('left')}
+                  title="Align signing zone for Left hand"
+                >
+                  Left Hand
+                </button>
+                <button
+                  type="button"
+                  className={`btn btn--xs ${effectiveSigningSide === 'right' ? 'btn--primary' : 'btn--ghost'}`}
+                  onClick={() => setSigningHandPref('right')}
+                  title="Align signing zone for Right hand"
+                >
+                  Right Hand
+                </button>
+              </div>
+            )}
+          </div>
 
           {/* Live Signing Hint */}
           <div className="signing-hint" role="status">
-            {handDetected
-              ? 'Hand tracked — hold sign steady for 3 frames to append'
-              : 'Position hand upright in the signing zone away from your face'}
+            {getHintMessage()}
           </div>
         </div>
       )}
@@ -222,7 +407,18 @@ export function CameraView({ onFrame, onPrediction, useStabilizer, captureDebugC
           </button>
         )}
 
-        {devices.length > 0 && (
+        <button
+          className={`btn ${sampleMode ? 'btn--primary' : 'btn--ghost'}`}
+          onClick={() => {
+            if (state === 'active') stop();
+            setSampleMode((prev) => !prev);
+          }}
+          aria-label="Toggle sample demo mode"
+        >
+          {sampleMode ? 'Exit Sample Mode' : 'Sample Mode (Demo)'}
+        </button>
+
+        {devices.length > 0 && !sampleMode && (
           <select
             className="btn btn--ghost btn--sm"
             value={selectedDeviceId || ''}
