@@ -6,7 +6,7 @@
   display: grid;
   grid-template-rows: var(--header-height) 1fr;
   min-height: 100vh;
-  background: var(--color-bg-deep);
+  background: transparent;
 }
 
 .header {
@@ -15,7 +15,9 @@
   justify-content: space-between;
   height: var(--header-height);
   padding: 0 var(--space-5);
-  background: var(--color-bg-surface);
+  background: rgba(24, 24, 27, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--color-border);
   position: sticky;
   top: 0;
@@ -35,20 +37,30 @@
   color: var(--color-accent);
 }
 
+.brand-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
 .brand-text {
+  display: block;
   font-family: var(--font-family);
   font-size: var(--font-size-lg);
   font-weight: var(--font-weight-semibold);
   letter-spacing: -0.02em;
+  line-height: 1.2;
   color: var(--color-text-primary);
 }
 
 .brand-subtitle {
+  display: block;
   font-family: var(--font-family);
-  font-size: var(--font-size-xs);
+  font-size: 0.6875rem; /* 11px */
   font-weight: var(--font-weight-regular);
   text-transform: uppercase;
   letter-spacing: 0.08em;
+  line-height: 1.2;
   color: var(--color-text-muted);
 }
 
@@ -145,7 +157,9 @@
 
 /* Panel base */
 .panel {
-  background: var(--color-bg-surface);
+  background: rgba(24, 24, 27, 0.9);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   overflow: hidden;

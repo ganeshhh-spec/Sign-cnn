@@ -61,7 +61,7 @@ export function TranslationPanel({ stabilized, serverText, onTextChange }: Trans
     <div className="panel translation-panel">
       <div className="translation-header">
         <h3 className="translation-title">Translation</h3>
-        <span className="translation-length">{length} characters</span>
+        <span className="translation-length">{length === 1 ? '1 character' : `${length} characters`}</span>
       </div>
 
       <div className="translation-content">

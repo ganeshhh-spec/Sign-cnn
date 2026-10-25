@@ -1,10 +1,12 @@
 /**
  * ModelInfo - Displays model information and metrics
+ * Integrated with GlowCard spotlight effect.
  */
 
 import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 import type { HealthResponse, ClassesResponse } from '../types/api';
+import { GlowCard } from './ui/spotlight-card';
 import './layout.css';
 
 interface ModelInfoProps {
@@ -46,21 +48,21 @@ export function ModelInfo({ className = '' }: ModelInfoProps) {
 
   if (loading) {
     return (
-      <div className={`panel info-panel ${className}`}>
+      <GlowCard customSize glowColor="blue" className={`info-panel ${className}`}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--space-8)' }}>
           <span style={{ color: 'var(--color-text-muted)' }}>Loading model info...</span>
         </div>
-      </div>
+      </GlowCard>
     );
   }
 
   if (error || !health) {
     return (
-      <div className={`panel info-panel ${className}`}>
+      <GlowCard customSize glowColor="red" className={`info-panel ${className}`}>
         <div style={{ color: 'var(--color-error)', padding: 'var(--space-4)' }}>
           Failed to load model info: {error}
         </div>
-      </div>
+      </GlowCard>
     );
   }
 
@@ -69,7 +71,7 @@ export function ModelInfo({ className = '' }: ModelInfoProps) {
   const statusColor = health.gpu_available ? 'var(--color-success)' : 'var(--color-warning)';
 
   return (
-    <div className={`panel info-panel ${className}`}>
+    <GlowCard customSize glowColor="blue" className={`info-panel ${className}`}>
       <h4 className="info-title">Model Information</h4>
 
       <div className="info-grid">
@@ -205,6 +207,8 @@ export function ModelInfo({ className = '' }: ModelInfoProps) {
         <strong style={{ color: 'var(--color-text-primary)' }}>Note:</strong> The accuracy metrics above are from held-out dataset evaluation.
         Real-world webcam accuracy may differ due to lighting, background, hand position, and camera quality variations.
       </p>
-    </div>
+    </GlowCard>
   );
 }
+
+export default ModelInfo;

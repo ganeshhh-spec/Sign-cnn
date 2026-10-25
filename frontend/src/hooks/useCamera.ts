@@ -351,7 +351,7 @@ export function useCamera({
     error,
     videoRef,
     canvasRef,
-    frameCount: frameCountRef.current,
+    frameCountRef,
     start,
     stop,
     switchCamera,
